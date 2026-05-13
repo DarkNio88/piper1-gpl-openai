@@ -100,6 +100,120 @@ def main() -> None:
     default_voice = PiperVoice.load(model_path, use_cuda=args.cuda)
     loaded_voices: Dict[str, PiperVoice] = {default_model_id: default_voice}
 
+    def synthesize_bytes(data: Dict[str, Any]) -> bytes:
+        """Synthesize audio bytes from a request-like dict.
+
+        Accepts both Piper-style requests (text) and OpenAI-style (input/model).
+        """
+        # Accept either OpenAI's `input` or Piper's `text`
+        text = (data.get("text") or data.get("input") or "").strip()
+        if not text:
+            raise ValueError("No text provided")
+
+        _LOGGER.debug(data)
+
+        # Voice/model selection: accept `voice` or `model` (OpenAI uses `model`)
+        model_id = data.get("voice") or data.get("model") or default_model_id
+        voice = loaded_voices.get(model_id)
+        if voice is None:
+            for data_dir in args.data_dir:
+                maybe_model_path = Path(data_dir) / f"{model_id}.onnx"
+                if maybe_model_path.exists():
+                    _LOGGER.debug("Loading voice %s", model_id)
+                    voice = PiperVoice.load(maybe_model_path, use_cuda=args.cuda)
+                    loaded_voices[model_id] = voice
+                    break
+
+        if voice is None:
+            _LOGGER.warning("Voice not found: %s. Using default voice.", model_id)
+            voice = default_voice
+
+        speaker_id: Optional[int] = data.get("speaker_id")
+        if (voice.config.num_speakers > 1) and (speaker_id is None):
+            speaker = data.get("speaker")
+            if speaker:
+                speaker_id = voice.config.speaker_id_map.get(speaker)
+
+            if speaker_id is None:
+                _LOGGER.warning(
+                    "Speaker not found: '%s' in %s",
+                    speaker,
+                    voice.config.speaker_id_map.keys(),
+                )
+                speaker_id = args.speaker or 0
+
+        if (speaker_id is not None) and (speaker_id > voice.config.num_speakers):
+            speaker_id = 0
+
+        syn_config = SynthesisConfig(
+            speaker_id=speaker_id,
+            length_scale=float(
+                data.get(
+                    "length_scale",
+                    (
+                        args.length_scale
+                        if args.length_scale is not None
+                        else voice.config.length_scale
+                    ),
+                )
+            ),
+            noise_scale=float(
+                data.get(
+                    "noise_scale",
+                    (
+                        args.noise_scale
+                        if args.noise_scale is not None
+                        else voice.config.noise_scale
+                    ),
+                )
+            ),
+            noise_w_scale=float(
+                data.get(
+                    "noise_w_scale",
+                    (
+                        args.noise_w_scale
+                        if args.noise_w_scale is not None
+                        else voice.config.noise_w_scale
+                    ),
+                )
+            ),
+        )
+
+        _LOGGER.debug("Synthesizing text: '%s' with config=%s", text, syn_config)
+        with io.BytesIO() as wav_io:
+            wav_file: Optional[wave.Wave_write] = None
+            wav_params_set = False
+            try:
+                for i, audio_chunk in enumerate(voice.synthesize(text, syn_config)):
+                    if wav_file is None:
+                        # Open WAV writer lazily once we have the first chunk
+                        wav_file = wave.open(wav_io, "wb")
+                        wav_file.setframerate(audio_chunk.sample_rate)
+                        wav_file.setsampwidth(audio_chunk.sample_width)
+                        wav_file.setnchannels(audio_chunk.sample_channels)
+                        wav_params_set = True
+
+                    if i > 0:
+                        wav_file.writeframes(
+                            bytes(
+                                int(
+                                    voice.config.sample_rate * args.sentence_silence * 2
+                                )
+                            )
+                        )
+
+                    wav_file.writeframes(audio_chunk.audio_int16_bytes)
+
+            finally:
+                if wav_file is not None:
+                    wav_file.close()
+
+            if not wav_params_set:
+                # No audio produced (synthesis failed early)
+                raise ValueError("No audio produced by voice.synthesize()")
+
+            return wav_io.getvalue()
+
     # Create web server
     app = Flask(__name__)
 
@@ -185,103 +299,34 @@ def main() -> None:
           "length_w_scale": 0.8          (optional)
         }
         """
-        data = json.loads(request.data)
-        text = data.get("text", "").strip()
-        if not text:
-            raise ValueError("No text provided")
+        try:
+            data = json.loads(request.data)
+            wav = synthesize_bytes(data)
+            return app.response_class(wav, mimetype="audio/wav")
+        except Exception:
+            _LOGGER.exception("Error in app_synthesize")
+            import traceback
 
-        _LOGGER.debug(data)
+            tb = traceback.format_exc()
+            return app.response_class(tb, mimetype="text/plain", status=500)
 
-        model_id = data.get("voice", default_model_id)
-        voice = loaded_voices.get(model_id)
-        if voice is None:
-            for data_dir in args.data_dir:
-                maybe_model_path = Path(data_dir) / f"{model_id}.onnx"
-                if maybe_model_path.exists():
-                    _LOGGER.debug("Loading voice %s", model_id)
-                    voice = PiperVoice.load(maybe_model_path, use_cuda=args.cuda)
-                    loaded_voices[model_id] = voice
-                    break
+    @app.route("/v1/audio/speech", methods=["POST"])
+    def app_openai_speech() -> bytes:
+        """OpenAI-compatible TTS endpoint.
 
-        if voice is None:
-            _LOGGER.warning("Voice not found: %s. Using default voice.", model_id)
-            voice = default_voice
+        Accepts JSON like {"input": "text", "model": "voice-name", ...}
+        and returns `audio/wav` bytes.
+        """
+        try:
+            data = request.get_json(force=True)
+            wav = synthesize_bytes(data)
+            return app.response_class(wav, mimetype="audio/wav")
+        except Exception:
+            _LOGGER.exception("Error in app_openai_speech")
+            import traceback
 
-        speaker_id: Optional[int] = data.get("speaker_id")
-        if (voice.config.num_speakers > 1) and (speaker_id is None):
-            speaker = data.get("speaker")
-            if speaker:
-                speaker_id = voice.config.speaker_id_map.get(speaker)
-
-            if speaker_id is None:
-                _LOGGER.warning(
-                    "Speaker not found: '%s' in %s",
-                    speaker,
-                    voice.config.speaker_id_map.keys(),
-                )
-                speaker_id = args.speaker or 0
-
-        if (speaker_id is not None) and (speaker_id > voice.config.num_speakers):
-            speaker_id = 0
-
-        syn_config = SynthesisConfig(
-            speaker_id=speaker_id,
-            length_scale=float(
-                data.get(
-                    "length_scale",
-                    (
-                        args.length_scale
-                        if args.length_scale is not None
-                        else voice.config.length_scale
-                    ),
-                )
-            ),
-            noise_scale=float(
-                data.get(
-                    "noise_scale",
-                    (
-                        args.noise_scale
-                        if args.noise_scale is not None
-                        else voice.config.noise_scale
-                    ),
-                )
-            ),
-            noise_w_scale=float(
-                data.get(
-                    "noise_w_scale",
-                    (
-                        args.noise_w_scale
-                        if args.noise_w_scale is not None
-                        else voice.config.noise_w_scale
-                    ),
-                )
-            ),
-        )
-
-        _LOGGER.debug("Synthesizing text: '%s' with config=%s", text, syn_config)
-        with io.BytesIO() as wav_io:
-            wav_file: wave.Wave_write = wave.open(wav_io, "wb")
-            with wav_file:
-                wav_params_set = False
-                for i, audio_chunk in enumerate(voice.synthesize(text, syn_config)):
-                    if not wav_params_set:
-                        wav_file.setframerate(audio_chunk.sample_rate)
-                        wav_file.setsampwidth(audio_chunk.sample_width)
-                        wav_file.setnchannels(audio_chunk.sample_channels)
-                        wav_params_set = True
-
-                    if i > 0:
-                        wav_file.writeframes(
-                            bytes(
-                                int(
-                                    voice.config.sample_rate * args.sentence_silence * 2
-                                )
-                            )
-                        )
-
-                    wav_file.writeframes(audio_chunk.audio_int16_bytes)
-
-            return wav_io.getvalue()
+            tb = traceback.format_exc()
+            return app.response_class(tb, mimetype="text/plain", status=500)
 
     app.run(host=args.host, port=args.port)
 
