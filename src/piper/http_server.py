@@ -8,8 +8,14 @@ import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.request import urlopen
+import os
 
-from flask import Flask, request
+from flask import Flask, request, Response, jsonify, render_template
+import subprocess
+import threading
+import time
+import uuid
+import shlex
 
 from . import PiperVoice, SynthesisConfig
 from .download_voices import VOICES_JSON, download_voice
@@ -67,7 +73,13 @@ def main() -> None:
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
+    parser.add_argument(
+        "--train-password",
+        help="Password required to start/stop training (or set PIPER_TRAIN_PASSWORD)",
+    )
     args = parser.parse_args()
+    # Training password (optional)
+    train_password = args.train_password or os.environ.get("PIPER_TRAIN_PASSWORD")
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     _LOGGER.debug(args)
 
@@ -214,8 +226,97 @@ def main() -> None:
 
             return wav_io.getvalue()
 
-    # Create web server
-    app = Flask(__name__)
+    # Create web server (serve web/ templates and static for UI)
+    repo_root = Path(__file__).resolve().parents[2]
+    template_folder = str(repo_root / "web" / "templates")
+    static_folder = str(repo_root / "web" / "static")
+    app = Flask(__name__, template_folder=template_folder, static_folder=static_folder)
+
+    # Reload templates automatically when they change and avoid static caching
+    # so HTML/CSS edits are reflected without restarting the server.
+    app.config["TEMPLATES_AUTO_RELOAD"] = True
+    app.jinja_env.auto_reload = True
+    # Reduce static file caching (useful during development)
+    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
+
+    # Protect training endpoints if a training password is configured.
+    def _train_auth_ok() -> bool:
+        if not train_password:
+            return True
+
+        # Check Authorization: Bearer <password>
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+            if token == train_password:
+                return True
+
+        # Check HTTP Basic auth (password match)
+        auth = request.authorization
+        if auth and auth.password == train_password:
+            return True
+
+        # Check JSON or form field 'train_password'
+        # Use silent=True to avoid raising on non-JSON requests
+        try:
+            body = request.get_json(silent=True) or {}
+            if body.get("train_password") == train_password:
+                return True
+        except Exception:
+            pass
+
+        if request.form and request.form.get("train_password") == train_password:
+            return True
+
+        if request.args.get("train_password") == train_password:
+            return True
+
+        return False
+
+    @app.before_request
+    def _require_train_auth():
+        # Only enforce for training endpoints
+        if request.path.startswith("/train"):
+            if _train_auth_ok():
+                return None
+            return Response("Unauthorized", 401, {"WWW-Authenticate": 'Basic realm="Piper Training"'})
+
+    @app.route("/", methods=["GET"])
+    def app_index():
+        """Serve training UI HTML."""
+        return render_template("index.html")
+
+    # Training job management (start/list/logs/stop)
+    JOBS: Dict[str, dict] = {}
+    JOBS_LOCK = threading.Lock()
+
+
+    def _make_job_record() -> dict:
+        return {
+            "id": None,
+            "cmd": None,
+            "proc": None,
+            "logs": [],
+            "status": "queued",
+            "start_time": None,
+            "end_time": None,
+        }
+
+
+    def _reader_thread(proc: subprocess.Popen, job_id: str) -> None:
+        # Stream stdout lines into the job logs.
+        try:
+            with proc.stdout:
+                for line in iter(proc.stdout.readline, ""):
+                    if not line:
+                        break
+                    with JOBS_LOCK:
+                        JOBS[job_id]["logs"].append(line.rstrip())
+        finally:
+            ret = proc.wait()
+            with JOBS_LOCK:
+                JOBS[job_id]["status"] = "finished" if ret == 0 else "error"
+                JOBS[job_id]["end_time"] = time.time()
 
     @app.route("/voices", methods=["GET"])
     def app_voices() -> Dict[str, Any]:
@@ -327,6 +428,112 @@ def main() -> None:
 
             tb = traceback.format_exc()
             return app.response_class(tb, mimetype="text/plain", status=500)
+
+    # ------------------------
+    # Training control API
+    # ------------------------
+    @app.route("/train/start", methods=["POST"])
+    def app_train_start():
+        # Accept JSON body for training parameters.
+        data = request.get_json(force=True) or {}
+
+        voice_name = data.get("voice_name") or data.get("voice")
+        csv_path = data.get("csv_path")
+        audio_dir = data.get("audio_dir")
+        sample_rate = data.get("sample_rate")
+        batch_size = data.get("batch_size")
+        ckpt_path = data.get("ckpt_path")
+        extra_args = data.get("extra_args", "")
+
+        cmd = ["python3", "-m", "piper.train", "fit"]
+        if voice_name:
+            cmd += ["--data.voice_name", str(voice_name)]
+        if csv_path:
+            cmd += ["--data.csv_path", str(csv_path)]
+        if audio_dir:
+            cmd += ["--data.audio_dir", str(audio_dir)]
+        if sample_rate:
+            cmd += ["--model.sample_rate", str(sample_rate)]
+        if batch_size:
+            cmd += ["--data.batch_size", str(batch_size)]
+        if ckpt_path:
+            cmd += ["--ckpt_path", str(ckpt_path)]
+        if extra_args:
+            cmd += shlex.split(str(extra_args))
+
+        job_id = str(uuid.uuid4())[:8]
+        job = _make_job_record()
+        job["id"] = job_id
+        job["cmd"] = " ".join(shlex.quote(c) for c in cmd)
+        job["status"] = "running"
+        job["start_time"] = time.time()
+
+        # Start the process in the repository root so relative paths work.
+        cwd = Path.cwd()
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=str(cwd)
+        )
+        job["proc"] = proc
+
+        with JOBS_LOCK:
+            JOBS[job_id] = job
+
+        t = threading.Thread(target=_reader_thread, args=(proc, job_id), daemon=True)
+        t.start()
+
+        return jsonify({"job_id": job_id, "cmd": job["cmd"]}), 201
+
+
+    @app.route("/train/jobs", methods=["GET"])
+    def app_train_jobs():
+        with JOBS_LOCK:
+            return jsonify(
+                {
+                    jid: {"status": j["status"], "cmd": j["cmd"], "started": j["start_time"]}
+                    for jid, j in JOBS.items()
+                }
+            )
+
+
+    @app.route("/train/logs/<job_id>")
+    def app_train_logs(job_id: str):
+        # Server-Sent Events stream of log lines for the job.
+        def generate():
+            last = 0
+            while True:
+                with JOBS_LOCK:
+                    j = JOBS.get(job_id)
+                    if not j:
+                        yield "data: [ERROR] job not found\n\n"
+                        return
+                    logs = list(j.get("logs", []))
+                    status = j.get("status", "unknown")
+                if last < len(logs):
+                    for line in logs[last:]:
+                        yield f"data: {line}\n\n"
+
+                    last = len(logs)
+                if status in ("finished", "error", "cancelled"):
+                    yield f"data: [END] status={status}\n\n"
+
+                    break
+                time.sleep(0.5)
+
+        return Response(generate(), mimetype="text/event-stream")
+
+
+    @app.route("/train/stop/<job_id>", methods=["POST"])
+    def app_train_stop(job_id: str):
+        with JOBS_LOCK:
+            job = JOBS.get(job_id)
+            if not job:
+                return jsonify({"error": "job not found"}), 404
+            proc = job.get("proc")
+            if proc and proc.poll() is None:
+                proc.terminate()
+                job["status"] = "cancelled"
+                return jsonify({"status": "terminated"})
+            return jsonify({"status": "not running"})
 
     app.run(host=args.host, port=args.port)
 

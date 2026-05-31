@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Start Piper HTTP server in a detached screen session
 SESSION_NAME="piper_server"
-CMD="python3 -m piper.http_server -m it_IT-paola-medium --host 0.0.0.0 --debug"
+CMD="python3 -m piper.http_server -m it_IT-paola-medium --train-password notsodarknio --host 0.0.0.0 --debug"
 
 # If a virtualenv exists in .venv, prefer activating it
 #if [ -f ".venv/bin/activate" ]; then
