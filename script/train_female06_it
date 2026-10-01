@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import subprocess
+import venv
+from pathlib import Path
+
+
+_DIR = Path(__file__).parent
+_PROGRAM_DIR = _DIR.parent
+_VENV_DIR = _PROGRAM_DIR / ".venv"
+
+
+def resolve_python_exe() -> str:
+    if _VENV_DIR.exists():
+        context = venv.EnvBuilder().ensure_directories(_VENV_DIR)
+        return context.env_exe
+
+    return "python3"
+
+
+def validate_dataset(csv_path: Path, audio_dir: Path, strict: bool) -> None:
+    rows = []
+    with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+        reader = csv.reader(csv_file, delimiter="|")
+        for line_no, raw in enumerate(reader, start=1):
+            if not raw:
+                continue
+
+            filename = raw[0].strip() if len(raw) > 0 else ""
+            text = "|".join(raw[1:]).strip() if len(raw) > 1 else ""
+            rows.append((line_no, filename, text))
+
+    if not rows:
+        raise ValueError(f"Metadata is empty: {csv_path}")
+
+    missing_audio = []
+    empty_text = []
+    placeholders = []
+
+    for line_no, filename, text in rows:
+        if not filename:
+            missing_audio.append((line_no, "<empty filename>"))
+            continue
+
+        if not (audio_dir / filename).exists():
+            missing_audio.append((line_no, filename))
+
+        if not text:
+            empty_text.append((line_no, filename))
+
+        if "TODO: replace with exact transcript" in text:
+            placeholders.append((line_no, filename))
+
+    if missing_audio:
+        details = ", ".join([f"line {line}:{name}" for line, name in missing_audio[:5]])
+        raise FileNotFoundError(
+            "Some metadata entries reference missing audio files: " + details
+        )
+
+    if empty_text:
+        details = ", ".join([f"line {line}:{name}" for line, name in empty_text[:5]])
+        raise ValueError("Some metadata entries have empty text: " + details)
+
+    if placeholders and strict:
+        details = ", ".join([f"line {line}:{name}" for line, name in placeholders[:5]])
+        raise ValueError(
+            "Replace transcript placeholders before training: " + details
+        )
+
+    if len(rows) < 10:
+        print(
+            "WARNING: very small dataset ("
+            f"{len(rows)} rows). Quality will likely be poor."
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Start Piper training for an Italian female06 dataset"
+    )
+    parser.add_argument("--dataset-dir", default="training_data/female06_it")
+    parser.add_argument("--voice-name", default="female06_it")
+    parser.add_argument("--sample-rate", type=int, default=22050)
+    parser.add_argument("--espeak-voice", default="it")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--cache-dir", default="training_data/female06_it/cache")
+    parser.add_argument(
+        "--config-path",
+        default="training_data/female06_it/female06_it.onnx.json",
+    )
+    parser.add_argument("--ckpt-path", default="")
+    parser.add_argument(
+        "--max-epochs",
+        type=int,
+        default=1,
+        help="Trainer max epochs (default: 1) to produce a checkpoint quickly",
+    )
+    parser.add_argument(
+        "--default-root-dir",
+        default="training_runs/female06_it",
+        help="Lightning output root directory for checkpoints/logs",
+    )
+    parser.add_argument(
+        "--limit-train-batches",
+        type=float,
+        default=1.0,
+        help="Fraction/number of train batches to use per epoch (default: 1.0)",
+    )
+    parser.add_argument(
+        "--limit-val-batches",
+        type=float,
+        default=1.0,
+        help="Fraction/number of val batches to use per epoch (default: 1.0)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print command without starting training",
+    )
+    parser.add_argument(
+        "--allow-placeholder",
+        action="store_true",
+        help="Allow TODO transcript placeholders in metadata",
+    )
+    args, extra_args = parser.parse_known_args()
+
+    dataset_dir = Path(args.dataset_dir)
+    if not dataset_dir.is_absolute():
+        dataset_dir = _PROGRAM_DIR / dataset_dir
+
+    csv_path = dataset_dir / "metadata.csv"
+    audio_dir = dataset_dir / "audio"
+
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Missing metadata: {csv_path}. Run script/prepare_female06_dataset first."
+        )
+
+    if not audio_dir.exists():
+        raise FileNotFoundError(
+            f"Missing audio dir: {audio_dir}. Run script/prepare_female06_dataset first."
+        )
+
+    validate_dataset(
+        csv_path=csv_path,
+        audio_dir=audio_dir,
+        strict=(not args.allow_placeholder),
+    )
+
+    cache_dir = Path(args.cache_dir)
+    if not cache_dir.is_absolute():
+        cache_dir = _PROGRAM_DIR / cache_dir
+
+    config_path = Path(args.config_path)
+    if not config_path.is_absolute():
+        config_path = _PROGRAM_DIR / config_path
+
+    default_root_dir = Path(args.default_root_dir)
+    if not default_root_dir.is_absolute():
+        default_root_dir = _PROGRAM_DIR / default_root_dir
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    default_root_dir.mkdir(parents=True, exist_ok=True)
+
+    python_exe = resolve_python_exe()
+
+    cmd = [
+        python_exe,
+        "-m",
+        "piper.train",
+        "fit",
+        "--data.voice_name",
+        args.voice_name,
+        "--data.csv_path",
+        str(csv_path),
+        "--data.audio_dir",
+        str(audio_dir),
+        "--model.sample_rate",
+        str(args.sample_rate),
+        "--data.espeak_voice",
+        args.espeak_voice,
+        "--data.cache_dir",
+        str(cache_dir),
+        "--data.config_path",
+        str(config_path),
+        "--data.batch_size",
+        str(args.batch_size),
+        "--trainer.max_epochs",
+        str(args.max_epochs),
+        "--trainer.enable_checkpointing",
+        "true",
+        "--trainer.default_root_dir",
+        str(default_root_dir),
+        "--trainer.limit_train_batches",
+        str(args.limit_train_batches),
+        "--trainer.limit_val_batches",
+        str(args.limit_val_batches),
+    ]
+
+    # Forward any extra arguments directly to piper.train
+    if extra_args:
+        cmd.extend(extra_args)
+
+    if args.ckpt_path:
+        ckpt_path = Path(args.ckpt_path)
+        if not ckpt_path.is_absolute():
+            ckpt_path = _PROGRAM_DIR / ckpt_path
+        cmd.extend(["--ckpt_path", str(ckpt_path)])
+    else:
+        print(
+            "WARNING: --ckpt-path not provided. Fine-tuning from a checkpoint is strongly recommended."
+        )
+
+    print("Training command:")
+    print(" ".join(cmd))
+
+    if not args.dry_run:
+        subprocess.check_call(cmd)
+
+
+if __name__ == "__main__":
+    main()

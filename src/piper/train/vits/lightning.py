@@ -72,6 +72,7 @@ class VitsModel(L.LightningModule):
         c_kl: float = 1.0,
         grad_clip: Optional[float] = None,
         vocoder_warmstart_ckpt: Optional[str] = None,
+        warmstart_ckpt: Optional[str] = None,
         # unused
         dataset: object = None,
         **kwargs,
@@ -116,6 +117,7 @@ class VitsModel(L.LightningModule):
         # Used to partially load the state dict from a checkpoint.
         # Only the text/phoneme agnostic portions are loaded.
         self._vocoder_warmstart_ckpt = vocoder_warmstart_ckpt
+        self._warmstart_ckpt = warmstart_ckpt
 
         # Set up models
         self.model_g = SynthesizerTrn(
@@ -340,8 +342,24 @@ class VitsModel(L.LightningModule):
         self.load_state_dict(new_sd, strict=False)
         _LOGGER.info(f"[warmstart] Copied {copied} vocoder parameters from {ckpt_path}")
 
+    def _warmstart_from_ckpt(self, ckpt_path: str):
+        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        old_sd = ckpt["state_dict"]
+        new_sd = self.state_dict()
+        copied = 0
+        for k, v in old_sd.items():
+            if (k in new_sd) and (new_sd[k].shape == v.shape):
+                new_sd[k] = v
+                copied += 1
+        self.load_state_dict(new_sd, strict=False)
+        _LOGGER.info(f"[warmstart] Copied {copied} parameters from {ckpt_path}")
+
     def on_fit_start(self):
         # Called once at the start of fit()
+        if self._warmstart_ckpt is not None:
+            # Full-parameter warmstart (fresh run seeded from a previous checkpoint)
+            self._warmstart_from_ckpt(self._warmstart_ckpt)
+            self._warmstart_ckpt = None
         if self._vocoder_warmstart_ckpt is None:
             return
 

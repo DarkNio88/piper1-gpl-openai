@@ -102,6 +102,7 @@ def main() -> None:
             "input_lengths": {0: "batch_size"},
             "output": {0: "batch_size", 2: "time"},
         },
+        dynamo=False,
     )
     _LOGGER.info("Exported model to %s", output_path)
 

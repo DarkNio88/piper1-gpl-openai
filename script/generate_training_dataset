@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""
+Genera un dataset di training per Piper scaricando frasi TTS da Darknio.
+Usa frasi lunghe e le scompone in molte varianti per massimizzare i dati.
+"""
+
+import csv
+import re
+import subprocess
+import sys
+import wave
+from pathlib import Path
+
+BASE_URL = "http://www2.darknio.ovh/tts_wav.php?text="
+CURL_TIMEOUT = 7200  # 120 minuti per richiesta (frasi da 10 min di audio)
+
+
+def is_valid_wav(path: Path) -> bool:
+    """Verifica che il file sia un WAV valido con audio."""
+    try:
+        with wave.open(str(path), "rb") as w:
+            return w.getnframes() > 50 and w.getframerate() > 0
+    except Exception:
+        return False
+
+
+def expand_phrases(text: str) -> list[str]:
+    """
+    Genera frasi LUNGHE ma accettabili da Darknio (max ~150 parole per via del limite URL).
+    Darknio accetta URL fino a ~4000-8000 caratteri, quindi 150 parole = ~1400 caratteri.
+
+    Ogni frase di 150 parole produce circa 45-60 secondi di audio.
+    Per ottenere 10 minuti di training, servono tante frasi (non una singola lunghissima).
+
+    Strategia:
+    - Paragrafi interi
+    - Finestre scorrevoli da 50 a 150 parole
+    - Frasi intere concatenate
+    """
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return []
+
+    all_text = " ".join(paragraphs)
+    all_words = all_text.split()
+    total_words = len(all_words)
+
+    phrases: set[str] = set()
+
+    # 1) Se il testo e' piccolo, moltiplicalo per avere abbastanza parole
+    if total_words < 300:
+        repeat = 600 // total_words + 1
+        all_text = " ".join([all_text] * repeat)
+        all_words = all_text.split()
+        total_words = len(all_words)
+        print(f"   Testo moltiplicato x{repeat} per avere {total_words} parole")
+
+    # 2) Paragrafi interi
+    for para in paragraphs:
+        phrases.add(para)
+
+    # 3) Finestre scorrevoli: 100-150 parole, passo 40
+    if total_words >= 100:
+        for size in [150, 120, 100, 80, 60]:
+            step = size // 3
+            for start in range(0, total_words - size + 1, step):
+                chunk = " ".join(all_words[start:start+size])
+                if len(chunk.split()) >= 50:
+                    phrases.add(chunk)
+
+    # 4) Frasi intere + combinazioni di frasi
+    sents = re.split(r"(?<=[.!?:])\s+", all_text)
+    sents = [s.strip() for s in sents if s.strip()]
+
+    # Accumula frasi fino a 100-120 parole
+    buf: list[str] = []
+    buf_len = 0
+    for sent in sents:
+        wc = len(sent.split())
+        if buf_len + wc > 110 and buf:
+            combo = " ".join(buf)
+            if len(combo.split()) >= 50:
+                phrases.add(combo)
+            buf = []
+            buf_len = 0
+        if wc >= 50:
+            phrases.add(sent)
+        else:
+            buf.append(sent)
+            buf_len += wc
+    if buf:
+        combo = " ".join(buf)
+        if len(combo.split()) >= 50:
+            phrases.add(combo)
+
+    # 5) Finestre dall'inizio con varie lunghezze
+    for start in range(0, min(total_words, 600), 50):
+        for size in [80, 100, 120, 150]:
+            if start + size <= total_words:
+                chunk = " ".join(all_words[start:start+size])
+                if len(chunk.split()) >= 50:
+                    phrases.add(chunk)
+
+    # Filtra: solo frasi tra 50 e 150 parole
+    filtered = [p for p in phrases if 50 <= len(p.split()) <= 150]
+
+    if not filtered:
+        # Fallback: usa tutto il testo disponibile
+        filtered = list(phrases)
+
+    print(f"   Parole totali: {total_words}")
+    print(f"   Frasi generate: {len(filtered)} (50-150 parole ciascuna)")
+    print(f"   ~{len(filtered) * 60 // 60} minuti totali di audio stimati")
+
+    return sorted(filtered, key=lambda p: len(p.split()))
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="""\
+Genera un dataset di training per Piper da un file di testo.
+
+Il file di testo sorgente viene scomposto in centinaia di varianti
+(frasi intere, frammenti, finestre scorrevoli) e ogni variante viene
+scaricata come audio TTS da Darknio.
+
+ESEMPIO:
+  ./script/generate_training_dataset --text-file training_data/female06_it/source_text.txt
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--text-file",
+        required=True,
+        help="Percorso del file di testo sorgente (con tante frasi italiane)",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        default="training_data/female06_dataset",
+        help="Cartella dove salvare il dataset (default: training_data/female06_dataset)",
+    )
+    parser.add_argument(
+        "--prefix",
+        default="utt",
+        help="Prefisso per i nomi dei file WAV (default: utt)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Limite massimo di file da scaricare (0 = nessun limite)",
+    )
+    parser.add_argument(
+        "--no-download",
+        action="store_true",
+        help="Solo genera le richieste, non scaricare (utile per ispezionare)",
+    )
+    args = parser.parse_args()
+
+    # --- Prepara percorsi ---
+    repo_dir = Path(__file__).resolve().parent.parent
+    text_file = Path(args.text_file)
+    if not text_file.is_absolute():
+        text_file = repo_dir / text_file
+
+    dataset_dir = Path(args.dataset_dir)
+    if not dataset_dir.is_absolute():
+        dataset_dir = repo_dir / dataset_dir
+
+    audio_dir = dataset_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Leggi testo e genera frasi ---
+    print(f"📖 Leggo: {text_file}")
+    text = text_file.read_text(encoding="utf-8")
+    phrases = expand_phrases(text)
+
+    print(f"🔢 Totale frasi generate: {len(phrases)}")
+    for i in range(min(3, len(phrases))):
+        print(f"   Frase {i+1}: {len(phrases[i].split())} parole, inizio: {phrases[i][:80]}...")
+    print(f"   ...")
+    for i in range(max(0, len(phrases)-3), len(phrases)):
+        print(f"   Frase {i+1}: {len(phrases[i].split())} parole, inizio: {phrases[i][:80]}...")
+
+    if args.no_download:
+        # Salva solo le richieste in un CSV
+        req_path = dataset_dir / "requests.csv"
+        with req_path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f, delimiter="|")
+            w.writerow(["filename", "text", "url"])
+            for idx, phrase in enumerate(phrases, start=1):
+                import urllib.parse
+
+                fn = f"{args.prefix}_{idx:04d}.wav"
+                url = BASE_URL + urllib.parse.quote(phrase, safe="")
+                w.writerow([fn, phrase, url])
+        print(f"💾 Richieste salvate in: {req_path}")
+        return
+
+    # --- Scarica ogni frase ---
+    req_path = dataset_dir / "requests.csv"
+    entries_file = dataset_dir / "entries_to_add.csv"
+    meta_file = dataset_dir / "metadata.csv"
+
+    entries: list[tuple[str, str]] = []
+    ok = 0
+    fail = 0
+    total = len(phrases) if args.limit == 0 else min(len(phrases), args.limit)
+    start_idx = 0
+    resume_file = dataset_dir / ".download_progress.txt"
+
+    # Riprendi da dove eravamo rimasti
+    if resume_file.exists():
+        try:
+            start_idx = int(resume_file.read_text().strip())
+            print(f"🔄 Riprendo dal file {start_idx+1}/{total}")
+        except ValueError:
+            pass
+
+    if args.limit > 0:
+        phrases = phrases[: args.limit]
+
+    print(f"⬇️  Scarico {total} file da Darknio...")
+
+    for idx in range(start_idx, total):
+        phrase = phrases[idx]
+        fn = f"{args.prefix}_{idx+1:04d}.wav"
+        import urllib.parse
+
+        url = BASE_URL + urllib.parse.quote(phrase, safe="")
+        out = audio_dir / fn
+
+        wc = len(phrase.split())
+        print(f"   [{idx+1}/{total}] ({wc} parole, ~{wc//3//60}min di audio)...", end=" ", flush=True)
+
+        result = subprocess.run(
+            ["curl", "-L", "-s", "--max-time", str(CURL_TIMEOUT), url, "-o", str(out)],
+            capture_output=True,
+        )
+
+        if result.returncode == 0 and is_valid_wav(out):
+            with wave.open(str(out), "rb") as w:
+                dur = w.getnframes() / float(w.getframerate())
+            entries.append((fn, phrase))
+            ok += 1
+            print(f"✅ {dur:.1f}s")
+        else:
+            out.unlink(missing_ok=True)
+            fail += 1
+            print(f"❌")
+
+        # Salva progresso ogni 10 download
+        if (idx + 1) % 10 == 0 or idx == total - 1:
+            resume_file.write_text(str(idx + 1))
+
+        # Mostra riepilogo parziale
+        if (idx + 1) % 20 == 0:
+            print(f"\n   📊 Parziale: {ok} OK, {fail} falliti su {idx+1}")
+
+    # --- Scrivi i file finali ---
+    print(f"\n📝 Scrittura file finali...")
+
+    with entries_file.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="|")
+        for fn, phrase in entries:
+            w.writerow([fn, phrase])
+
+    with meta_file.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="|")
+        for fn, phrase in entries:
+            w.writerow([fn, phrase])
+
+    # Scrivi anche il file delle richieste (con URL)
+    with req_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f, delimiter="|")
+        w.writerow(["filename", "text", "url"])
+        for fn, phrase in entries:
+            import urllib.parse
+            url = BASE_URL + urllib.parse.quote(phrase, safe="")
+            w.writerow([fn, phrase, url])
+
+    # Rimuovi file di progresso
+    resume_file.unlink(missing_ok=True)
+
+    print(f"\n{'='*50}")
+    print(f"✅ DATASET COMPLETATO!")
+    print(f"{'='*50}")
+    print(f"   File validi: {ok}")
+    print(f"   Falliti:     {fail}")
+    print(f"   Totale:      {total}")
+    print(f"   Cartella:    {dataset_dir}")
+    print(f"   Audio:       {audio_dir}")
+    print(f"   Metadata:    {meta_file}")
+    print(f"   Richieste:   {req_path}")
+    print(f"\n👉 Per addestrare:")
+    print(f"   ./script/train_female06_it --dataset-dir {args.dataset_dir}")
+    print(f"      --voice-name mio_voice --espeak-voice it")
+    print(f"      --batch-size 1 --max-epochs 30")
+    print(f"      --model.vocoder_warmstart_ckpt checkpoints/hfc_female/hfc_female.ckpt")
+    print(f"      --default-root-dir training_runs/mio_voice")
+    print()
+
+
+if __name__ == "__main__":
+    main()

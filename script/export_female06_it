@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+import argparse
+import shutil
+import subprocess
+import venv
+from pathlib import Path
+
+
+_DIR = Path(__file__).parent
+_PROGRAM_DIR = _DIR.parent
+_VENV_DIR = _PROGRAM_DIR / ".venv"
+
+
+def resolve_python_exe() -> str:
+    if _VENV_DIR.exists():
+        context = venv.EnvBuilder().ensure_directories(_VENV_DIR)
+        return context.env_exe
+
+    return "python3"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Export a trained female06 Italian checkpoint to ONNX"
+    )
+    parser.add_argument("--checkpoint", required=True, help="Path to .ckpt file")
+    parser.add_argument(
+        "--output-file",
+        default="training_data/female06_it/female06_it-medium.onnx",
+        help="Output ONNX path",
+    )
+    parser.add_argument(
+        "--config-path",
+        default="training_data/female06_it/female06_it.onnx.json",
+        help="Config JSON generated during training",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print command without exporting",
+    )
+    args = parser.parse_args()
+
+    checkpoint = Path(args.checkpoint)
+    if not checkpoint.is_absolute():
+        checkpoint = _PROGRAM_DIR / checkpoint
+
+    output_file = Path(args.output_file)
+    if not output_file.is_absolute():
+        output_file = _PROGRAM_DIR / output_file
+
+    config_path = Path(args.config_path)
+    if not config_path.is_absolute():
+        config_path = _PROGRAM_DIR / config_path
+
+    if not checkpoint.exists() and not args.dry_run:
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+
+    if not checkpoint.exists() and args.dry_run:
+        print(f"WARNING: checkpoint not found (dry-run only): {checkpoint}")
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    python_exe = resolve_python_exe()
+    cmd = [
+        python_exe,
+        "-m",
+        "piper.train.export_onnx",
+        "--checkpoint",
+        str(checkpoint),
+        "--output-file",
+        str(output_file),
+    ]
+
+    print("Export command:")
+    print(" ".join(cmd))
+
+    if not args.dry_run:
+        subprocess.check_call(cmd)
+
+        target_config = output_file.with_suffix(output_file.suffix + ".json")
+        if config_path.exists():
+            shutil.copy2(config_path, target_config)
+            print(f"Copied config: {target_config}")
+        else:
+            print(
+                "WARNING: config file was not found and could not be copied: "
+                f"{config_path}"
+            )
+
+
+if __name__ == "__main__":
+    main()

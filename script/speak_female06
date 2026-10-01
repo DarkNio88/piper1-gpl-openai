@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+import argparse
+import struct
+import subprocess
+import sys
+import wave
+from pathlib import Path
+
+_DIR = Path(__file__).parent
+_PROG = _DIR.parent
+_MODEL = _PROG / "female06_v5_epoch13.onnx"
+_CONFIG = _PROG / "female06_v5_epoch13.onnx.json"
+_VENV = _PROG / ".venv"
+
+def main():
+    parser = argparse.ArgumentParser(description="Parla con la voce female06 (con rimozione automaticha del ronzio)")
+    parser.add_argument("text", help="Testo da pronunciare")
+    parser.add_argument("-f", "--output-file", default="output.wav", help="File WAV output")
+    parser.add_argument("--noise-scale", type=float, default=0.667)
+    parser.add_argument("--noise-w", type=float, default=0.8)
+    parser.add_argument("--length-scale", type=float, default=1.0)
+    args = parser.parse_args()
+
+    temp = _PROG / "output_raw.wav"
+    
+    py = sys.executable
+    if _VENV.exists():
+        import venv
+        py = venv.EnvBuilder().ensure_directories(_VENV).env_exe
+    
+    # Run Piper
+    cmd = [
+        py, "-m", "piper",
+        "-m", str(_MODEL), "-c", str(_CONFIG),
+        "-f", str(temp),
+        "--noise-scale", str(args.noise_scale),
+        "--noise-w-scale", str(args.noise_w),
+        "--length-scale", str(args.length_scale),
+        "--", args.text
+    ]
+    subprocess.check_call(cmd, cwd=str(_PROG))
+
+    # Read and remove DC offset
+    with wave.open(str(temp), 'rb') as w:
+        frames = w.getnframes()
+        sr = w.getframerate()
+        nch = w.getnchannels()
+        sw = w.getsampwidth()
+        data = w.readframes(frames)
+    
+    vals = list(struct.unpack('<' + str(len(data)//2) + 'h', data))
+    mean = sum(vals) / len(vals)
+    vals_clean = [max(-32768, min(32767, int(v - mean))) for v in vals]
+    
+    # Write clean output
+    out = wave.open(str(args.output_file), 'w')
+    out.setnchannels(nch)
+    out.setsampwidth(sw)
+    out.setframerate(sr)
+    out.writeframes(struct.pack('<' + str(len(vals_clean)) + 'h', *vals_clean))
+    out.close()
+    temp.unlink(missing_ok=True)
+    
+    print(f"✅ Audio pulito salvato in: {args.output_file}")
+    print(f"📊 DC offset rimosso: {mean:.0f}")
+
+if __name__ == "__main__":
+    main()

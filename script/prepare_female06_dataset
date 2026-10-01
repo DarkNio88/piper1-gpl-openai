@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import shutil
+from pathlib import Path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prepare a minimal Piper dataset from female_06.wav. "
+            "You should replace the transcript with the exact spoken text."
+        )
+    )
+    parser.add_argument(
+        "--wav-path",
+        default="female_06.wav",
+        help="Input WAV path (default: female_06.wav at repository root)",
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        default="training_data/female06_it",
+        help="Output dataset directory",
+    )
+    parser.add_argument(
+        "--transcript",
+        default="",
+        help="Exact transcript for the utterance",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing metadata entry",
+    )
+
+    args = parser.parse_args()
+
+    repo_dir = Path(__file__).resolve().parent.parent
+    wav_path = Path(args.wav_path)
+    if not wav_path.is_absolute():
+        wav_path = repo_dir / wav_path
+
+    if not wav_path.exists():
+        raise FileNotFoundError(f"WAV not found: {wav_path}")
+
+    dataset_dir = Path(args.dataset_dir)
+    if not dataset_dir.is_absolute():
+        dataset_dir = repo_dir / dataset_dir
+
+    audio_dir = dataset_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    target_wav = audio_dir / wav_path.name
+    if wav_path.resolve() != target_wav.resolve():
+        shutil.copy2(wav_path, target_wav)
+
+    metadata_path = dataset_dir / "metadata.csv"
+    transcript = args.transcript.strip()
+    if not transcript:
+        transcript = "TODO: replace with exact transcript"
+
+    row = [target_wav.name, transcript]
+
+    if metadata_path.exists() and not args.force:
+        raise FileExistsError(
+            f"{metadata_path} already exists. Use --force to overwrite it."
+        )
+
+    with metadata_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.writer(csv_file, delimiter="|")
+        writer.writerow(row)
+
+    print(f"Dataset prepared in: {dataset_dir}")
+    print(f"Audio: {target_wav}")
+    print(f"Metadata: {metadata_path}")
+    print(
+        "IMPORTANT: this is a one-utterance dataset. For good quality, add more Italian WAV + transcript rows."
+    )
+
+
+if __name__ == "__main__":
+    main()

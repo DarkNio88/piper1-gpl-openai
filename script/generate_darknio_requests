@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+import argparse
+import re
+import sys
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+def split_chunks(text: str, max_words: int = 12) -> list[str]:
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+
+    chunks: list[str] = []
+    for p in parts:
+        words = p.split()
+        if len(words) <= max_words:
+            chunks.append(p)
+            continue
+
+        buf = []
+        for w in words:
+            buf.append(w)
+            if len(buf) >= max_words:
+                chunks.append(" ".join(buf))
+                buf = []
+        if buf:
+            chunks.append(" ".join(buf))
+
+    return chunks
+
+
+def split_words(text: str) -> list[str]:
+    return re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9']+", text)
+
+
+def is_valid_wav(path: Path) -> bool:
+    """Check that file starts with RIFF header and has valid WAV structure."""
+    try:
+        with path.open("rb") as f:
+            header = f.read(4)
+            if header != b"RIFF":
+                return False
+            # Check for WAVE subchunk
+            f.seek(8)
+            wave_id = f.read(4)
+            if wave_id != b"WAVE":
+                return False
+            # Try to open with wave module for full validation
+            import wave
+            with wave.open(str(path), "rb") as w:
+                return w.getnframes() > 0 and w.getframerate() > 0
+    except Exception:
+        return False
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Generate many Darknio TTS requests")
+    parser.add_argument("--text-file", required=True)
+    parser.add_argument("--dataset-dir", default="training_data/female06_it")
+    parser.add_argument("--prefix", default="darknio_chunk")
+    parser.add_argument("--max-words", type=int, default=30)
+    parser.add_argument(
+        "--mode",
+        choices=["chunks", "words"],
+        default="chunks",
+        help="chunks: split text into long phrases (default), words: one per word",
+    )
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Download wav files immediately into dataset audio dir",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=600.0,
+        help="HTTP timeout in seconds (default 600 = 10 minuti)",
+    )
+    parser.add_argument(
+        "--darknio-timeout",
+        type=float,
+        default=8.0,
+        help="Per-chunk timeout for Darknio endpoint (default 8s)",
+    )
+    args = parser.parse_args()
+
+    repo = Path(__file__).resolve().parent.parent
+
+    text_file = Path(args.text_file)
+    if not text_file.is_absolute():
+        text_file = repo / text_file
+
+    dataset_dir = Path(args.dataset_dir)
+    if not dataset_dir.is_absolute():
+        dataset_dir = repo / dataset_dir
+
+    audio_dir = dataset_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    text = text_file.read_text(encoding="utf-8")
+    words = split_words(text)
+    if args.mode == "words":
+        items = words
+        item_label = "items_words"
+    else:
+        items = split_chunks(text, max_words=args.max_words)
+        item_label = "items_chunks"
+
+    entries_path = dataset_dir / "entries_to_add.csv"
+    req_path = dataset_dir / "darknio_requests.csv"
+
+    base = "https://www2.darknio.ovh/tts_wav.php?text="
+    req_lines = ["filename|text|url"]
+    entry_lines = []
+    ok = 0
+    fail = 0
+
+    # Optional local Piper model for fallback
+    pip_mod = repo / "female06_finetuned-medium.onnx"
+    pip_cfg = repo / "female06_finetuned-medium.onnx.json"
+    import subprocess
+
+    for i, chunk in enumerate(items, start=1):
+        filename = f"{args.prefix}_{i:03d}.wav"
+        url = base + urllib.parse.quote(chunk, safe="")
+        target = audio_dir / filename
+        saved = False
+
+        if args.download:
+            # 1) Try Darknio endpoint (quick timeout per chunk)
+            try:
+                with urllib.request.urlopen(url, timeout=args.darknio_timeout) as response:
+                    target.write_bytes(response.read())
+                if is_valid_wav(target):
+                    saved = True
+                    ok += 1
+                else:
+                    target.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            # 2) Fallback to local Piper synthesis if Darknio failed
+            if not saved and pip_mod.exists() and pip_cfg.exists():
+                try:
+                    subprocess.run(
+                        [sys.executable or "python3", "-m", "piper",
+                         "-m", str(pip_mod), "-c", str(pip_cfg),
+                         "-f", str(target), "--", chunk],
+                        check=True, capture_output=True,
+                        cwd=str(repo),
+                    )
+                    if is_valid_wav(target):
+                        saved = True
+                        ok += 1
+                except Exception:
+                    pass
+
+            # 3) If still not saved, leave an empty/invalid marker
+            if not saved:
+                fail += 1
+
+        if saved:
+            entry_lines.append(f"{filename}|{chunk}")
+
+        req_lines.append(f"{filename}|{chunk}|{url}")
+
+    if entry_lines:
+        entries_path.write_text("\n".join(entry_lines) + "\n", encoding="utf-8")
+    req_path.write_text("\n".join(req_lines) + "\n", encoding="utf-8")
+
+    print(f"word_count={len(words)}")
+    print(f"{item_label}={len(items)}")
+    print(f"download_enabled={args.download}")
+    print(f"download_ok={ok}")
+    print(f"download_fail={fail}")
+    if entry_lines:
+        print(f"entries={entries_path}")
+    print(f"requests={req_path}")
+
+
+if __name__ == "__main__":
+    main()

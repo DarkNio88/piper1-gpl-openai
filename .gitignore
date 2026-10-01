@@ -20,3 +20,7 @@ src/piper/train/vits/monotonic_align/core.c
 *.so
 
 lightning_logs/
+cache_*/
+checkpoints/*
+training_data/*
+female06-it-medium-*

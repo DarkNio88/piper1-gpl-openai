@@ -3,78 +3,21 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Piper — Training UI</title>
+    <title>Piper — Sintesi vocale</title>
     <link rel="stylesheet" href="/static/style.css" />
   </head>
   <body>
     <main>
-      <h1>Piper — Avvia Training</h1>
-      <p style="color:#666;margin-top:4px">Interfaccia per avviare training e sintetizzare testo. Protezione training tramite password opzionale.</p>
+      <h1>Piper — Sintesi vocale</h1>
+      <p style="color:#666;margin-top:4px">Interfaccia per sintetizzare testo con le voci locali.</p>
 
       <div id="banner" class="banner" role="status" aria-live="polite" style="display:none"></div>
 
       <div class="tabs">
-        <button class="tab-button active" data-tab="training">Training</button>
-        <button class="tab-button" data-tab="tts">Scrivi e ascolta</button>
+        <button class="tab-button active" data-tab="tts">Scrivi e ascolta</button>
       </div>
 
-      <div id="tab-training" class="tab-panel active">
-        <form id="trainForm">
-          <label>Voice name
-            <input name="voice_name" placeholder="es: my_voice" />
-          </label>
-
-          <label>CSV path
-            <input name="csv_path" placeholder="/path/to/metadata.csv" />
-          </label>
-
-          <label>Audio dir
-            <input name="audio_dir" placeholder="/path/to/audio/" />
-          </label>
-
-          <label>Sample rate
-            <input name="sample_rate" placeholder="22050" />
-          </label>
-
-          <label>Batch size
-            <input name="batch_size" placeholder="32" />
-          </label>
-
-          <label>Checkpoint (optional)
-            <input name="ckpt_path" placeholder="/path/to/ckpt.ckpt" />
-          </label>
-
-          <label>Extra args
-            <input name="extra_args" placeholder='--data.phoneme_type text' />
-          </label>
-
-          <label>Password (training)
-            <input name="train_password" type="password" placeholder="Password per avviare training" />
-          </label>
-
-          <div class="actions">
-            <button id="startBtn" type="submit">Start training</button>
-            <button id="stopBtn" type="button" disabled>Stop job</button>
-            <button id="clearLogsBtn" type="button">Clear logs</button>
-          </div>
-        </form>
-
-        <section id="run">
-          <h2>Log</h2>
-          <div style="display:flex;gap:12px;align-items:center;margin-bottom:8px">
-            <div>
-              <button id="refreshJobsBtn" type="button">Refresh jobs</button>
-              <label style="margin-left:8px;font-size:90%"><input id="autoRefreshJobs" type="checkbox" /> Auto-refresh</label>
-            </div>
-            <div id="jobSummary" style="color:#444;font-size:90%"></div>
-          </div>
-          <div id="jobsList" style="margin-bottom:8px"></div>
-          <div id="logbox"><pre id="logpre"></pre></div>
-          <div id="jobInfo" style="margin-top:8px;color:#333"></div>
-        </section>
-      </div>
-
-      <div id="tab-tts" class="tab-panel">
+      <div id="tab-tts" class="tab-panel active">
         <section id="tts">
           <h2>Scrivi e ascolta</h2>
 
@@ -126,141 +69,6 @@
         function showError(text, timeout) { showBanner('error', text, timeout); }
         function showSuccess(text, timeout) { showBanner('success', text, timeout); }
         function showInfo(text, timeout) { showBanner('info', text, timeout); }
-
-        // Training UI elements
-        const form = document.getElementById('trainForm');
-        const startBtn = document.getElementById('startBtn');
-        const stopBtn = document.getElementById('stopBtn');
-        const clearLogsBtn = document.getElementById('clearLogsBtn');
-        const refreshJobsBtn = document.getElementById('refreshJobsBtn');
-        const autoRefreshJobs = document.getElementById('autoRefreshJobs');
-        const jobsList = document.getElementById('jobsList');
-        const jobSummary = document.getElementById('jobSummary');
-        const logpre = document.getElementById('logpre');
-        const logbox = document.getElementById('logbox');
-        const jobInfo = document.getElementById('jobInfo');
-
-        let es = null;
-        let currentJobId = null;
-        let jobsInterval = null;
-
-        function appendLog(line) {
-          logpre.textContent += line + '\n';
-          logbox.scrollTop = logbox.scrollHeight;
-        }
-
-        function clearLogs() { logpre.textContent = ''; }
-
-        async function fetchJobs() {
-          try {
-            const res = await fetch('/train/jobs');
-            if (!res.ok) throw new Error('Impossibile ottenere job');
-            const data = await res.json();
-            renderJobs(data);
-            return data;
-          } catch (err) {
-            jobsList.innerHTML = '<div style="color:crimson">Errore caricamento jobs</div>';
-            return {};
-          }
-        }
-
-        function renderJobs(data) {
-          jobsList.innerHTML = '';
-          const ids = Object.keys(data || {});
-          let running = 0;
-          ids.forEach(jid => {
-            const j = data[jid];
-            const el = document.createElement('div');
-            el.style.padding = '6px 8px';
-            el.style.border = '1px solid #eee';
-            el.style.marginBottom = '6px';
-            el.innerHTML = `<strong>${jid}</strong> — <em>${j.status}</em><div style="font-size:90%">${j.cmd || ''}</div>`;
-            const actions = document.createElement('div');
-            actions.style.marginTop = '6px';
-            const viewBtn = document.createElement('button');
-            viewBtn.textContent = 'View logs';
-            viewBtn.addEventListener('click', () => { subscribeToLogs(jid); jobInfo.textContent = `Job: ${jid} — ${j.cmd || ''}`; });
-            actions.appendChild(viewBtn);
-            const stopBtnLocal = document.createElement('button');
-            stopBtnLocal.style.marginLeft = '8px';
-            stopBtnLocal.textContent = 'Stop';
-            stopBtnLocal.addEventListener('click', async () => {
-              await fetch('/train/stop/' + jid, { method: 'POST' });
-              appendLog(`[UI] Requested stop for ${jid}`);
-              await fetchJobs();
-            });
-            actions.appendChild(stopBtnLocal);
-            el.appendChild(actions);
-            jobsList.appendChild(el);
-            if (j.status === 'running') running += 1;
-          });
-          jobSummary.textContent = `Jobs: ${ids.length} — Running: ${running}`;
-        }
-
-        function subscribeToLogs(jobId) {
-          if (es) try { es.close(); } catch (e) {}
-          currentJobId = jobId;
-          clearLogs();
-          es = new EventSource('/train/logs/' + jobId);
-          es.onmessage = (ev) => { appendLog(ev.data); };
-          es.onerror = (e) => { appendLog('[SSE] connection closed'); if (es) try { es.close(); } catch (e) {} };
-          startBtn.disabled = true;
-          stopBtn.disabled = false;
-        }
-
-        form.addEventListener('submit', async (e) => {
-          e.preventDefault();
-          startBtn.disabled = true;
-          clearLogs();
-          jobInfo.textContent = '';
-
-          const formData = new FormData(form);
-          const obj = Object.fromEntries(formData.entries());
-
-          try {
-            const resp = await fetch('/train/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) });
-            if (!resp.ok) {
-              const txt = await resp.text();
-              showError('Start failed: ' + txt);
-              startBtn.disabled = false;
-              return;
-            }
-            const json = await resp.json();
-            subscribeToLogs(json.job_id);
-            jobInfo.textContent = `Job: ${json.job_id} — ${json.cmd}`;
-            await fetchJobs();
-          } catch (err) {
-            showError('Errore start: ' + (err && err.message ? err.message : err));
-            startBtn.disabled = false;
-          }
-        });
-
-        stopBtn.addEventListener('click', async () => {
-          if (!currentJobId) return;
-          stopBtn.disabled = true;
-          try {
-            const pw = (new FormData(form)).get('train_password');
-            const headers = pw ? { 'Content-Type': 'application/json' } : undefined;
-            await fetch('/train/stop/' + currentJobId, { method: 'POST', headers, body: pw ? JSON.stringify({ train_password: pw }) : undefined });
-            appendLog(`[UI] Requested stop for ${currentJobId}`);
-            if (es) try { es.close(); } catch (e) {}
-            startBtn.disabled = false;
-            await fetchJobs();
-          } catch (err) {
-            appendLog('[UI] Error stopping job');
-            stopBtn.disabled = false;
-          }
-        });
-
-        clearLogsBtn.addEventListener('click', clearLogs);
-        refreshJobsBtn.addEventListener('click', () => fetchJobs());
-        autoRefreshJobs.addEventListener('change', () => {
-          if (autoRefreshJobs.checked) {
-            jobsInterval = setInterval(fetchJobs, 3000);
-          } else if (jobsInterval) {
-            clearInterval(jobsInterval); jobsInterval = null;
-          }
-        });
 
         // ----------------------
         // TTS UI
@@ -356,7 +164,6 @@
 
         // Initialize
         loadVoices();
-        fetchJobs();
 
         // Tab switching
         document.querySelectorAll('.tab-button').forEach(btn => {
